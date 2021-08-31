@@ -2,6 +2,7 @@ use crate::debugger_command::DebuggerCommand;
 use crate::inferior::Inferior;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
+use crate::inferior::Status;
 
 pub struct Debugger {
     target: String,
@@ -32,18 +33,53 @@ impl Debugger {
         loop {
             match self.get_next_command() {
                 DebuggerCommand::Run(args) => {
+                    if self.inferior.is_some() {
+                        // there is already a inferior running
+                        // if it has not exited, kill it first
+                        self.inferior.as_mut().unwrap().kill();
+                        self.inferior = None;
+                    }
                     if let Some(inferior) = Inferior::new(&self.target, &args) {
                         // Create the inferior
                         self.inferior = Some(inferior);
                         // TODO (milestone 1): make the inferior run
                         // You may use self.inferior.as_mut().unwrap() to get a mutable reference
                         // to the Inferior object
-                        self.inferior.as_mut().unwrap().continue_run(None).unwrap();
+                        match self.inferior.as_mut().unwrap().continue_run(None).unwrap() {
+                            Status::Exited(exit_code) => {
+                                println!("Child exited (status {})", exit_code);
+                                self.inferior = None;
+                            }
+                            Status::Signaled(signal) => {
+                                println!("Child exited due to signal {}", signal);
+                                self.inferior = None;
+                            }
+                            Status::Stopped(signal, rip) => println!("Child stopped by signal {} at address {:#x}", signal, rip),
+                        }
                     } else {
                         println!("Error starting subprocess");
                     }
                 }
+                DebuggerCommand::Continue => {
+                    if self.inferior.is_none() {
+                       println!("Error: you can not use continue when there is no process running!");
+                    } else {
+                        match self.inferior.as_mut().unwrap().continue_run(None).unwrap() {
+                            Status::Exited(exit_code) => {
+                                println!("Child exited (status {})", exit_code);
+                                self.inferior = None;
+                            }
+                            Status::Signaled(signal) => {
+                                println!("Child exited due to signal {}", signal);
+                                self.inferior = None;
+                            }
+                            Status::Stopped(signal, rip) => println!("Child stopped by signal {} at address {:#x}", signal, rip),
+                        }
+                    }
+                }
                 DebuggerCommand::Quit => {
+                    self.inferior.as_mut().unwrap().kill();
+                    self.inferior = None;
                     return;
                 }
             }
