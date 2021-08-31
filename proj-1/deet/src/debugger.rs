@@ -38,6 +38,7 @@ impl Debugger {
                         // TODO (milestone 1): make the inferior run
                         // You may use self.inferior.as_mut().unwrap() to get a mutable reference
                         // to the Inferior object
+                        self.inferior.as_mut().unwrap().continue_run(None).unwrap();
                     } else {
                         println!("Error starting subprocess");
                     }

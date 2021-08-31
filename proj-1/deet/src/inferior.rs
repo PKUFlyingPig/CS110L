@@ -43,17 +43,13 @@ impl Inferior {
         unsafe {
             cmd.pre_exec(child_traceme);
         }
-        let child = cmd.spawn().ok()?;
-        let inferior = Inferior {child : child};
         // When a process that has PTRACE_TRACEME enabled calls exec, 
         // the operating system will load the specified program into the process,
         // and then (before the new program starts running) it will 
-        // pause the process using SIGTRAP. So we use ptrace::cont to wake up it
-        match inferior.continue_run(None).ok()? {
-            Status::Exited(exit_code) => println!("Child exited (status {})", exit_code),
-            Status::Signaled(signal) => println!("Child exited due to signal {}", signal),
-            Status::Stopped(signal, rip) => println!("Child stopped by signal {} at address {:#x}", signal, rip),
-        }
+        // pause the process using SIGTRAP. So at the time when inferior is returned,
+        // child process is paused.
+        let child = cmd.spawn().ok()?;
+        let inferior = Inferior {child : child};
         Some(inferior)
     }
 
@@ -76,8 +72,12 @@ impl Inferior {
         })
     }
 
-    pub fn continue_run(&self, signal: Option<signal::Signal>) -> Result<Status, nix::Error> {
+    pub fn continue_run(&self, signal: Option<signal::Signal>) -> Result<(), nix::Error> {
         ptrace::cont(self.pid(), signal)?;
-        self.wait(None)
+        Ok(match self.wait(None)? {
+            Status::Exited(exit_code) => println!("Child exited (status {})", exit_code),
+            Status::Signaled(signal) => println!("Child exited due to signal {}", signal),
+            Status::Stopped(signal, rip) => println!("Child stopped by signal {} at address {:#x}", signal, rip),
+        })
     }
 }
