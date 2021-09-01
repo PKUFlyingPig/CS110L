@@ -7,6 +7,7 @@ use std::process::Command;
 use std::os::unix::process::CommandExt;
 use crate::dwarf_data::DwarfData;
 use std::mem::size_of;
+use std::collections::HashMap;
 
 fn align_addr_to_word(addr: usize) -> usize {
     addr & (-(size_of::<usize>() as isize) as usize)
@@ -41,7 +42,7 @@ pub struct Inferior {
 impl Inferior {
     /// Attempts to start a new inferior process. Returns Some(Inferior) if successful, or None if
     /// an error is encountered.
-    pub fn new(target: &str, args: &Vec<String>, breakpoints: &Vec<usize>) -> Option<Inferior> {
+    pub fn new(target: &str, args: &Vec<String>, breakpoints: &mut HashMap<usize, u8>) -> Option<Inferior> {
         // TODO: implement me!
         let mut cmd = Command::new(target);
         cmd.args(args);
@@ -56,9 +57,10 @@ impl Inferior {
         let child = cmd.spawn().ok()?;
         let mut inferior = Inferior {child : child};
         // install breakpoints
-        for bp in breakpoints {
+        let bps = breakpoints.clone();
+        for bp in bps.keys() {
             match inferior.write_byte(*bp, 0xcc) {
-                Ok(_) => continue,
+                Ok(ori_instr) => {breakpoints.insert(*bp, ori_instr);}
                 Err(_) => println!("Invalid breakpoint address {:#x}", bp),
             }
         }
@@ -84,10 +86,37 @@ impl Inferior {
         })
     }
 
-    // wake up the paused inferior process
-    pub fn continue_run(&self, signal: Option<signal::Signal>) -> Result<Status, nix::Error> {
+    // Wake up the paused inferior process, there are two possibilities:
+    // (1) inferior process paused by breakpoints
+    // (2) inferior process paused by other signals (e.g. ctrl + c)
+    pub fn continue_run(&mut self, signal: Option<signal::Signal>, breakpoints: &HashMap<usize, u8>) -> Result<Status, nix::Error> {
+        let mut regs = ptrace::getregs(self.pid())?;        
+        let rip = regs.rip as usize;
+        // check if inferior stopped at a breakpoint
+        if let Some(ori_instr) = breakpoints.get(&(rip - 1)) {
+            println!("stopped at a breakpoint");
+            // restore the first byte of the instruction we replaced
+            self.write_byte(rip - 1, *ori_instr).unwrap();
+            // set %rip = %rip - 1 to rewind the instruction pointer
+            regs.rip = (rip - 1) as u64;
+            ptrace::setregs(self.pid(), regs).unwrap();
+            // go to the next instruction
+            ptrace::step(self.pid(), None).unwrap();
+            // wait for inferior to stop due to SIGTRAP, just return if the inferior terminates here
+            match self.wait(None).unwrap() {
+                Status::Exited(exit_code) => return Ok(Status::Exited(exit_code)), 
+                Status::Signaled(signal) => return Ok(Status::Signaled(signal)),
+                Status::Stopped(_, _) => {
+                    // restore 0xcc in the breakpoint location
+                    self.write_byte(rip - 1, 0xcc).unwrap();
+                }
+            }
+        }
+        // resume normal execution
         ptrace::cont(self.pid(), signal)?;
+        // wait for inferior to stop or terminate
         self.wait(None)
+
     }
 
     // kill the inferior, assume that the inferior is still alive
@@ -97,6 +126,13 @@ impl Inferior {
         println!("Killing running inferior (pid {})", self.pid())
     }
 
+    // // get the current value of %rip in this inferior process
+    // pub fn get_rip(&self) -> usize {
+    //     let regs = ptrace::getregs(self.pid())?;
+    //     return regs.rip as usize;
+    // }
+
+    // print backtrace of this inferior process
     pub fn print_backtrace(&self, debug_data: &DwarfData) -> Result<(), nix::Error> {
         let regs = ptrace::getregs(self.pid())?;        
         let mut rip = regs.rip as usize;
