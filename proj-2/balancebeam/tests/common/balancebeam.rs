@@ -28,8 +28,9 @@ impl BalanceBeam {
         let address = format!("127.0.0.1:{}", rng.gen_range(1024, 65535));
         let mut cmd = Command::new(BalanceBeam::target_bin_path());
         cmd.arg("--bind").arg(&address);
+        cmd.arg("--upstream");
         for upstream in upstreams {
-            cmd.arg("--upstream").arg(upstream);
+            cmd.arg(upstream);
         }
         if let Some(active_health_check_interval) = active_health_check_interval {
             cmd.arg("--active-health-check-interval")
