@@ -7,6 +7,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::{stream::StreamExt};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use std::io::{ErrorKind};
+
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -61,7 +63,7 @@ struct ProxyState {
 
     /// the status of the upstream servers, true for alive, false for dead, wrapped in a read/write lock
     #[allow(dead_code)]
-    upstream_status: RwLock<Vec<bool>>,
+    upstream_status: RwLock<(usize, Vec<bool>)>,
 }
 
 #[tokio::main]
@@ -98,7 +100,7 @@ async fn main() {
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
-        upstream_status: RwLock::new(vec![true;upstream_nums]),
+        upstream_status: RwLock::new((upstream_nums, vec![true;upstream_nums])),
     };
     let shared_state = Arc::new(state);
     while let Some(stream) = listener.next().await {
@@ -115,15 +117,41 @@ async fn main() {
     }
 }
 
-async fn connect_to_upstream(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
+async fn pick_random_alive_upstream(state: &Arc<ProxyState>) -> Option<usize> {
     let mut rng = rand::rngs::StdRng::from_entropy();
-    let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
-    let upstream_ip = &state.upstream_addresses[upstream_idx];
-    TcpStream::connect(upstream_ip).await.or_else(|err| {
-        log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
-        Err(err)
-    })
-    // TODO: implement failover (milestone 3)
+    // get the read lock, release automatically when the function return
+    let upstream_status_view = state.upstream_status.read().await;
+    if upstream_status_view.0 == 0 {
+        return None;
+    }
+    let mut upstream_idx;
+    loop {
+        upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
+        if upstream_status_view.1[upstream_idx] {
+            return Some(upstream_idx);
+        }
+    }
+}
+
+async fn connect_to_upstream(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
+    // connect to one of the upstream unless all are dead
+    loop {
+        if let Some(upstream_idx )= pick_random_alive_upstream(&state).await {
+            let upstream_ip = &state.upstream_addresses[upstream_idx];
+            match TcpStream::connect(upstream_ip).await {
+                Ok(stream) => return Ok(stream),
+                Err(err) => {
+                    log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
+                    // get the write lock and mark the upstream as dead
+                    let mut upstream_status_mut = state.upstream_status.write().await;
+                    upstream_status_mut.0 -= 1;
+                    upstream_status_mut.1[upstream_idx] = false;
+                }
+            }
+        } else {
+            return Err(std::io::Error::new(ErrorKind::Other, "All the upstream servers are down!"));
+        }
+    }
 }
 
 async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
