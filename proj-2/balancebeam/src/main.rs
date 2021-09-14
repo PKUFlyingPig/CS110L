@@ -6,6 +6,8 @@ use rand::{Rng, SeedableRng};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::{stream::StreamExt};
 use std::sync::Arc;
+use tokio::sync::RwLock;
+
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
 #[derive(Clap, Debug)]
@@ -56,6 +58,10 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
+
+    /// the status of the upstream servers, true for alive, false for dead, wrapped in a read/write lock
+    #[allow(dead_code)]
+    upstream_status: RwLock<Vec<bool>>,
 }
 
 #[tokio::main]
@@ -85,14 +91,15 @@ async fn main() {
     };
     log::info!("Listening for requests on {}", options.bind);
 
+    let upstream_nums = options.upstream.len();
     // Handle incoming connections
     let state = ProxyState {
         upstream_addresses: options.upstream,
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
+        upstream_status: RwLock::new(vec![true;upstream_nums]),
     };
-
     let shared_state = Arc::new(state);
     while let Some(stream) = listener.next().await {
         match stream {
