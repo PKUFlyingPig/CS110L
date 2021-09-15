@@ -6,10 +6,13 @@ use rand::{Rng, SeedableRng};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::{stream::StreamExt};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Mutex};
 use std::io::{ErrorKind};
 use std::time::Duration;
 use tokio::time::delay_for;
+use std::collections::HashMap;
+use std::net::{IpAddr};
+
 
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
@@ -52,20 +55,18 @@ struct CmdOptions {
 /// You should add fields to this struct in later milestones.
 struct ProxyState {
     /// How frequently we check whether upstream servers are alive (Milestone 4)
-    #[allow(dead_code)]
     active_health_check_interval: usize,
     /// Where we should send requests when doing active health checks (Milestone 4)
-    #[allow(dead_code)]
     active_health_check_path: String,
     /// Maximum number of requests an individual IP can make in a minute (Milestone 5)
-    #[allow(dead_code)]
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
 
     /// the status of the upstream servers, true for alive, false for dead, wrapped in a read/write lock
-    #[allow(dead_code)]
     upstream_status: RwLock<(usize, Vec<bool>)>,
+    /// rate limit counter
+    rate_limit_counter: Mutex<HashMap<IpAddr, usize>>,
 }
 
 #[tokio::main]
@@ -103,19 +104,41 @@ async fn main() {
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
         upstream_status: RwLock::new((upstream_nums, vec![true;upstream_nums])),
+        rate_limit_counter: Mutex::new(HashMap::new()),
     };
     let shared_state = Arc::new(state);
 
     // spawn active health check async func
-    let state_ref = shared_state.clone();
+    let state_ref_0 = shared_state.clone();
     tokio::spawn(async move {
-        active_health_check(state_ref).await;
+        active_health_check(state_ref_0).await;
     });
+
+    // spawn rate limit counter refresher
+    if shared_state.max_requests_per_minute > 0 {
+        let state_ref_1 = shared_state.clone();
+        tokio::spawn(async move {
+            rate_limit_counter_refresher(state_ref_1, 60).await;
+        });
+    }
 
     // handle incoming request in async func
     while let Some(stream) = listener.next().await {
         match stream {
-            Ok(stream) => {
+            Ok(mut stream) => {
+                if shared_state.max_requests_per_minute > 0 {
+                    let mut rate_limit_counter = shared_state.rate_limit_counter.lock().await;
+                    let ip_addr = stream.peer_addr().unwrap().ip();
+                    let count = rate_limit_counter.entry(ip_addr).or_insert(0);
+                    log::debug!("addr: {}, count: {}", ip_addr, count);
+                    *count += 1;
+                    if *count > shared_state.max_requests_per_minute {
+                        // block the client
+                        let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+                        response::write_to_stream(&response, &mut stream).await.unwrap();
+                        continue;
+                    }               
+                }
                 let shared_state_ref = shared_state.clone();
                 tokio::spawn(async move {
                     // Handle the connection!
@@ -125,6 +148,12 @@ async fn main() {
             Err(_) => { break; } 
         }
     }
+}
+
+async fn rate_limit_counter_refresher(state: Arc<ProxyState>, interval: u64) {
+    delay_for(Duration::from_secs(interval)).await;
+    let mut rate_limit_counter = state.rate_limit_counter.lock().await;
+    rate_limit_counter.clear();
 }
 
 /// check specific upstream server actively (no lock required)
