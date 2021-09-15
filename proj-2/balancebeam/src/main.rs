@@ -8,6 +8,8 @@ use tokio::{stream::StreamExt};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::io::{ErrorKind};
+use std::time::Duration;
+use tokio::time::delay_for;
 
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
@@ -103,6 +105,14 @@ async fn main() {
         upstream_status: RwLock::new((upstream_nums, vec![true;upstream_nums])),
     };
     let shared_state = Arc::new(state);
+
+    // spawn active health check async func
+    let state_ref = shared_state.clone();
+    tokio::spawn(async move {
+        active_health_check(state_ref).await;
+    });
+
+    // handle incoming request in async func
     while let Some(stream) = listener.next().await {
         match stream {
             Ok(stream) => {
@@ -117,6 +127,51 @@ async fn main() {
     }
 }
 
+/// check specific upstream server actively (no lock required)
+async fn check_server(state: &Arc<ProxyState>, idx: usize, path: &String) -> Option<usize> {
+    let upstream_ip = &state.upstream_addresses[idx];
+    let mut stream = connect_to_server(idx, &state).await.ok()?;
+    let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(path)
+            .header("Host", upstream_ip)
+            .body(Vec::new())
+            .unwrap();
+    let _ = request::write_to_stream(&request, &mut stream).await.ok()?;
+    let res = response::read_from_stream(&mut stream, &http::Method::GET).await.ok()?;
+    if res.status().as_u16() != 200 {
+        return None;
+    } else {
+        return Some(1);
+    }
+}
+
+/// check all the upstream servers actively (write lock required)
+async fn active_health_check(state: Arc<ProxyState>) {
+    let interval = state.active_health_check_interval as u64;
+    let path = &state.active_health_check_path;
+    loop {
+        delay_for(Duration::from_secs(interval)).await;
+        let mut upstream_status_mut = state.upstream_status.write().await;
+        for idx in 0..upstream_status_mut.1.len() {
+            if check_server(&state, idx, path).await.is_some() {
+                // down -> up
+                if !upstream_status_mut.1[idx] {
+                    upstream_status_mut.0 += 1;
+                    upstream_status_mut.1[idx] = true;
+                }
+            } else {
+                // up -> down
+                if upstream_status_mut.1[idx] {
+                    upstream_status_mut.0 -= 1;
+                    upstream_status_mut.1[idx] = false;
+                }
+            }
+        }
+    }
+}
+
+/// randomly pick one alive upstream and return its index (read lock acquired)
 async fn pick_random_alive_upstream(state: &Arc<ProxyState>) -> Option<usize> {
     let mut rng = rand::rngs::StdRng::from_entropy();
     // get the read lock, release automatically when the function return
@@ -133,15 +188,26 @@ async fn pick_random_alive_upstream(state: &Arc<ProxyState>) -> Option<usize> {
     }
 }
 
+/// attemp to connect to the specific upstream server (no lock required)
+async fn connect_to_server(upstream_idx: usize, state: &Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
+    let upstream_ip = &state.upstream_addresses[upstream_idx];
+    match TcpStream::connect(upstream_ip).await {
+        Ok(stream) => return Ok(stream),
+        Err(err) => {
+            log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
+            return Err(err);
+        }
+    }
+}
+
+/// randomly connect to one alive upstream, return error if all the upstream are dead
 async fn connect_to_upstream(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
     // connect to one of the upstream unless all are dead
     loop {
         if let Some(upstream_idx )= pick_random_alive_upstream(&state).await {
-            let upstream_ip = &state.upstream_addresses[upstream_idx];
-            match TcpStream::connect(upstream_ip).await {
+            match connect_to_server(upstream_idx, &state).await {
                 Ok(stream) => return Ok(stream),
-                Err(err) => {
-                    log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
+                Err(_) => {
                     // get the write lock and mark the upstream as dead
                     let mut upstream_status_mut = state.upstream_status.write().await;
                     upstream_status_mut.0 -= 1;
